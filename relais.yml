@@ -1,0 +1,64 @@
+name: Relais météo aéro (continu)
+
+# GitHub saute ou retarde très souvent les déclenchements planifiés (aucune exécution automatique pendant des heures).
+# Solution : l'exécution tourne en continu pendant ~5 h 30 (un relevé toutes les 6 min) puis relance elle-même
+# la suivante. Le déclenchement planifié (toutes les 30 min) ne sert plus que de filet de sécurité si la chaîne s'arrête.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:          # lancement manuel possible depuis l'onglet Actions
+
+permissions:
+  contents: write
+  actions: write              # nécessaire pour que l'exécution relance la suivante
+
+concurrency:
+  group: relais-meteo
+  cancel-in-progress: false   # la suivante attend la fin de la courante, sans l'annuler
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Relevés toutes les 6 min (METAR, TAF, NOTAM, observations)
+        env:
+          AUTOROUTER_EMAIL: ${{ secrets.AUTOROUTER_EMAIL }}
+          AUTOROUTER_PASSWORD: ${{ secrets.AUTOROUTER_PASSWORD }}
+          MF_APIKEY: ${{ secrets.MF_APIKEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          N=54
+          for i in $(seq 1 $N); do
+            START=$(date +%s)
+            echo "=== relevé $i / $N : $(date -u +%FT%TZ)"
+            # reprend le meteo.json déjà publié pour conserver l'historique des observations (24 h)
+            rm -f data/meteo.json
+            if git fetch --depth=1 origin data 2>/dev/null; then
+              git show FETCH_HEAD:meteo.json > data/meteo.json 2>/dev/null || rm -f data/meteo.json
+            fi
+            if timeout 120 python3 fetch_meteo.py; then
+              # publie sur la branche « data » réécrite à chaque fois (pas d'historique qui grossit)
+              rm -rf /tmp/pub && mkdir /tmp/pub && cp data/meteo.json /tmp/pub/
+              (
+                cd /tmp/pub
+                git init -q -b data
+                git config user.name "meteo-bot"
+                git config user.email "meteo-bot@users.noreply.github.com"
+                git add meteo.json
+                git commit -qm "maj $(date -u +%FT%TZ)"
+                git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+              ) || echo "publication échouée"
+            else
+              echo "relevé ignoré (échec ou aucun METAR)"
+            fi
+            # relance la chaîne un peu avant la fin : la suivante démarre dès que celle-ci se termine
+            if [ "$i" -eq $((N-1)) ]; then
+              gh workflow run relais.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" || echo "relance impossible"
+            fi
+            [ "$i" -lt "$N" ] && { ELAPSED=$(( $(date +%s) - START )); [ $ELAPSED -lt 360 ] && sleep $((360 - ELAPSED)); }
+          done
+          exit 0
