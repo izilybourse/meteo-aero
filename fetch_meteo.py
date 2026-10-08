@@ -269,24 +269,29 @@ def mf_get(path, key):
 
 
 def mf_obs(key, icao, sid):
-    paths = [_mf_path[0]] if _mf_path[0] else ["v2/station/infrahoraire-6m", "station/infrahoraire-6m"]
-    last = None
-    for base in paths:
-        try:
-            j = mf_get(f"{base}?id_station={sid}&format=geojson", key)
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code in (401, 403, 404):
-                continue
-            raise
-        _mf_path[0] = base
-        res = parse_mf_obs(j, icao)
-        res["id"] = sid
-        if not res["series"]:
-            first = ((j.get("features") or [{}])[0].get("properties") or {}) if isinstance(j, dict) and j.get("features") else {}
-            raise ValueError("aucune observation exploitable (champs: " + ",".join(sorted(first))[:160] + ")")
-        return res
-    raise last
+    """Interroge DPObs (v2 puis chemin sans version, formats json puis geojson) ; en cas d'échec, l'erreur contient un extrait de la réponse."""
+    bases = [_mf_path[0]] if _mf_path[0] else ["v2/station/infrahoraire-6m", "station/infrahoraire-6m", "v1/station/infrahoraire-6m"]
+    notes = []
+    for base in bases:
+        for fmt in ("json", "geojson"):
+            try:
+                j = mf_get(f"{base}?id_station={sid}&format={fmt}", key)
+            except urllib.error.HTTPError as e:
+                notes.append(f"{base}/{fmt}: HTTP {e.code}")
+                if e.code in (401, 403, 404, 400):
+                    continue
+                raise
+            res = parse_mf_obs(j, icao)
+            if res["series"]:
+                _mf_path[0] = base
+                res["id"] = sid
+                return res
+            try:
+                snip = json.dumps(j, ensure_ascii=False)[:220]
+            except Exception:
+                snip = str(j)[:220]
+            notes.append(f"{base}/{fmt}: réponse sans observation exploitable {snip}")
+    raise ValueError(" | ".join(notes)[:900])
 
 
 def main():
@@ -370,8 +375,8 @@ def main():
             if res["dist"] is not None and res["dist"] > 20:
                 out["errors"].append(f"mf {icao}: station {sid} à {res['dist']} km de l'aérodrome, vérifier l'identifiant")
         except Exception as e:
-            out["obsErr"][icao] = str(e)[:160]
-            out["errors"].append(f"mf {icao}: {str(e)[:160]}")
+            out["obsErr"][icao] = str(e)[:900]
+            out["errors"].append(f"mf {icao}: {str(e)[:900]}")
 
     if not metars:
         print("Aucun METAR récupéré — fichier non publié.", out["errors"], file=sys.stderr)
