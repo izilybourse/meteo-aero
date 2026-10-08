@@ -294,6 +294,33 @@ def mf_obs(key, icao, sid):
     raise ValueError(" | ".join(notes)[:900])
 
 
+def load_prev_obs():
+    """Historique des observations déjà publié (l'API ne renvoie que la dernière observation de 6 min) :
+    fichier data/meteo.json récupéré par le workflow, sinon lecture publique de la branche data."""
+    try:
+        with open("data/meteo.json", encoding="utf-8") as f:
+            return json.load(f).get("obs") or {}
+    except Exception:
+        pass
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if repo:
+        try:
+            req = urllib.request.Request(f"https://raw.githubusercontent.com/{repo}/data/meteo.json?t={int(time.time())}", headers=UA)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode("utf-8")).get("obs") or {}
+        except Exception:
+            pass
+    return {}
+
+
+def merge_series(prev, new, now=None):
+    now = now or time.time()
+    rows = {int(r[0]): r for r in (prev or []) if r and r[0] >= now - 25 * 3600}
+    for r in new:
+        rows[int(r[0])] = r
+    return [rows[k] for k in sorted(rows)]
+
+
 def main():
     out = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "stations": {}, "errors": []}
     metars, tafs = {}, {}
@@ -364,6 +391,7 @@ def main():
     # Observations Météo-France 6 min : température, humidité, pression, pluie (24 h glissantes)
     out["obsUpdated"] = out["updated"]
     out["obs"], out["obsErr"] = {}, {}
+    prev_obs = load_prev_obs()
     mf_key = os.environ.get("MF_APIKEY")
     for icao, sid in MF_STATIONS.items():
         if not mf_key:
@@ -371,6 +399,7 @@ def main():
             continue
         try:
             res = mf_obs(mf_key, icao, sid)
+            res["series"] = merge_series((prev_obs.get(icao) or {}).get("series"), res["series"])
             out["obs"][icao] = res
             if res["dist"] is not None and res["dist"] > 20:
                 out["errors"].append(f"mf {icao}: station {sid} à {res['dist']} km de l'aérodrome, vérifier l'identifiant")
