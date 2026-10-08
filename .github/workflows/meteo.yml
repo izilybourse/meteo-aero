@@ -19,6 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Reprend le meteo.json déjà publié pour conserver l'historique des observations (24 h)
+      - name: Récupérer l'historique publié
+        continue-on-error: true
+        run: |
+          git fetch --depth=1 origin data
+          mkdir -p data
+          git show FETCH_HEAD:meteo.json > data/meteo.json
+
       - name: Récupérer METAR, TAF et NOTAM
         env:
           AUTOROUTER_EMAIL: ${{ secrets.AUTOROUTER_EMAIL }}
