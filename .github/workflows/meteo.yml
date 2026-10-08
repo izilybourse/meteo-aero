@@ -1,0 +1,40 @@
+name: Relais météo aéro
+
+on:
+  schedule:
+    - cron: "*/6 * * * *"    # toutes les 6 min (GitHub peut retarder de quelques minutes)
+  workflow_dispatch:          # lancement manuel possible depuis l'onglet Actions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: meteo
+  cancel-in-progress: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Récupérer METAR, TAF et NOTAM
+        env:
+          AUTOROUTER_EMAIL: ${{ secrets.AUTOROUTER_EMAIL }}
+          AUTOROUTER_PASSWORD: ${{ secrets.AUTOROUTER_PASSWORD }}
+          MF_APIKEY: ${{ secrets.MF_APIKEY }}
+        run: python3 fetch_meteo.py
+
+      # Publie meteo.json sur une branche « data » réécrite à chaque fois
+      # (pas d'historique qui grossit, lecture publique avec CORS ouvert).
+      - name: Publier sur la branche data
+        run: |
+          mkdir /tmp/pub && cp data/meteo.json /tmp/pub/
+          cd /tmp/pub
+          git init -q -b data
+          git config user.name "meteo-bot"
+          git config user.email "meteo-bot@users.noreply.github.com"
+          git add meteo.json
+          git commit -qm "maj $(date -u +%FT%TZ)"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
