@@ -1,4 +1,4 @@
-name: Relais météo aéro (continu)
+name: Relais météo aéro
 
 # GitHub saute ou retarde très souvent les déclenchements planifiés (aucune exécution automatique pendant des heures).
 # Solution : l'exécution tourne en continu pendant ~5 h 30 (un relevé toutes les 6 min) puis relance elle-même
@@ -13,7 +13,7 @@ permissions:
   actions: write              # nécessaire pour que l'exécution relance la suivante
 
 concurrency:
-  group: relais-meteo
+  group: meteo
   cancel-in-progress: false   # la suivante attend la fin de la courante, sans l'annuler
 
 jobs:
@@ -57,7 +57,7 @@ jobs:
             fi
             # relance la chaîne un peu avant la fin : la suivante démarre dès que celle-ci se termine
             if [ "$i" -eq $((N-1)) ]; then
-              gh workflow run relais.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" || echo "relance impossible"
+              gh workflow run meteo.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" || echo "relance impossible"
             fi
             [ "$i" -lt "$N" ] && { ELAPSED=$(( $(date +%s) - START )); [ $ELAPSED -lt 360 ] && sleep $((360 - ELAPSED)); }
           done
