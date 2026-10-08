@@ -1,8 +1,10 @@
 name: Relais météo aéro
 
+# GitHub n'exécute pas les tâches planifiées de façon fiable à haute fréquence (retards de 10 à 60 min, exécutions sautées).
+# Solution : un déclenchement toutes les 20 min, et chaque exécution boucle elle-même (4 relevés espacés de 6 min).
 on:
   schedule:
-    - cron: "*/6 * * * *"    # toutes les 6 min (GitHub peut retarder de quelques minutes)
+    - cron: "*/20 * * * *"
   workflow_dispatch:          # lancement manuel possible depuis l'onglet Actions
 
 permissions:
@@ -10,39 +12,44 @@ permissions:
 
 concurrency:
   group: meteo
-  cancel-in-progress: true
+  cancel-in-progress: false   # une exécution en attend une autre au lieu de l'annuler
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      # Reprend le meteo.json déjà publié pour conserver l'historique des observations (24 h)
-      - name: Récupérer l'historique publié
-        continue-on-error: true
-        run: |
-          git fetch --depth=1 origin data
-          mkdir -p data
-          git show FETCH_HEAD:meteo.json > data/meteo.json
-
-      - name: Récupérer METAR, TAF et NOTAM
+      - name: Relevés toutes les 6 min (METAR, TAF, NOTAM, observations)
         env:
           AUTOROUTER_EMAIL: ${{ secrets.AUTOROUTER_EMAIL }}
           AUTOROUTER_PASSWORD: ${{ secrets.AUTOROUTER_PASSWORD }}
           MF_APIKEY: ${{ secrets.MF_APIKEY }}
-        run: python3 fetch_meteo.py
-
-      # Publie meteo.json sur une branche « data » réécrite à chaque fois
-      # (pas d'historique qui grossit, lecture publique avec CORS ouvert).
-      - name: Publier sur la branche data
         run: |
-          mkdir /tmp/pub && cp data/meteo.json /tmp/pub/
-          cd /tmp/pub
-          git init -q -b data
-          git config user.name "meteo-bot"
-          git config user.email "meteo-bot@users.noreply.github.com"
-          git add meteo.json
-          git commit -qm "maj $(date -u +%FT%TZ)"
-          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+          mkdir -p data
+          for i in 1 2 3 4; do
+            echo "=== relevé $i / 4 : $(date -u +%FT%TZ)"
+            # reprend le meteo.json déjà publié pour conserver l'historique des observations (24 h)
+            rm -f data/meteo.json
+            if git fetch --depth=1 origin data 2>/dev/null; then
+              git show FETCH_HEAD:meteo.json > data/meteo.json 2>/dev/null || rm -f data/meteo.json
+            fi
+            if python3 fetch_meteo.py; then
+              # publie sur la branche « data » réécrite à chaque fois (pas d'historique qui grossit)
+              rm -rf /tmp/pub && mkdir /tmp/pub && cp data/meteo.json /tmp/pub/
+              (
+                cd /tmp/pub
+                git init -q -b data
+                git config user.name "meteo-bot"
+                git config user.email "meteo-bot@users.noreply.github.com"
+                git add meteo.json
+                git commit -qm "maj $(date -u +%FT%TZ)"
+                git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+              ) || echo "publication échouée"
+            else
+              echo "relevé ignoré (aucun METAR)"
+            fi
+            [ "$i" -lt 4 ] && sleep 360
+          done
+          exit 0
