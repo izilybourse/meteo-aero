@@ -365,14 +365,14 @@ def main():
             except Exception as e:
                 out["errors"].append(f"tgftp taf {st}: {e}")
 
-    # Historique METAR 24 h (affiché en popup par la page)
+    # Historique METAR 6 h (affiché en popup par la page)
     hist = {}
     try:
-        for m in awc_json("metar", STATIONS, 24):
+        for m in awc_json("metar", STATIONS, 6):
             if m.get("rawOb") and m.get("obsTime"):
                 hist.setdefault(m["icaoId"], []).append({"icaoId": m["icaoId"], "obsTime": m["obsTime"], "rawOb": m["rawOb"]})
     except Exception as e:
-        out["errors"].append(f"awc metar 24h: {e}")
+        out["errors"].append(f"awc metar 6h: {e}")
 
     for st in STATIONS:
         out["stations"][st] = {"metar": metars.get(st), "taf": tafs.get(st),
