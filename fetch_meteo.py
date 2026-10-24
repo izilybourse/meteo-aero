@@ -38,8 +38,8 @@ def get(url, timeout=25):
         return r.read().decode("utf-8", "replace")
 
 
-def awc_json(kind, ids):
-    url = f"{AWC}{kind}?ids={','.join(ids)}&format=json" + ("&hours=3" if kind == "metar" else "")
+def awc_json(kind, ids, hours=3):
+    url = f"{AWC}{kind}?ids={','.join(ids)}&format=json" + (f"&hours={hours}" if kind == "metar" else "")
     txt = get(url).strip()
     return json.loads(txt) if txt else []
 
@@ -129,8 +129,15 @@ def autorouter_token(email, password):
                                    "client_secret": password}).encode()
     req = urllib.request.Request(AUTOROUTER + "oauth2/token", data=body, headers={
         **UA, "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))["access_token"]
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))["access_token"]
+    except urllib.error.HTTPError as e:      # remonte le message renvoyé par autorouter (compte non activé, identifiants refusés…)
+        try:
+            body = e.read().decode("utf-8", "replace")[:300].replace("\n", " ")
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code} {body}")
 
 
 def autorouter_notams(token, icao):
@@ -358,8 +365,18 @@ def main():
             except Exception as e:
                 out["errors"].append(f"tgftp taf {st}: {e}")
 
+    # Historique METAR 24 h (affiché en popup par la page)
+    hist = {}
+    try:
+        for m in awc_json("metar", STATIONS, 24):
+            if m.get("rawOb") and m.get("obsTime"):
+                hist.setdefault(m["icaoId"], []).append({"icaoId": m["icaoId"], "obsTime": m["obsTime"], "rawOb": m["rawOb"]})
+    except Exception as e:
+        out["errors"].append(f"awc metar 24h: {e}")
+
     for st in STATIONS:
-        out["stations"][st] = {"metar": metars.get(st), "taf": tafs.get(st)}
+        out["stations"][st] = {"metar": metars.get(st), "taf": tafs.get(st),
+                               "history": sorted(hist.get(st, []), key=lambda x: x["obsTime"])}
 
     # NOTAM en vigueur : autorouter en priorité (identifiants dans les secrets GitHub), repli FAA
     out["notamUpdated"] = out["updated"]
