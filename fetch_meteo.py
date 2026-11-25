@@ -17,8 +17,6 @@ from datetime import datetime, timezone
 
 # Aérodromes suivis + stations de repli (codes OACI)
 STATIONS = ["FMEE", "FMEP", "FMCZ", "FMCH"]
-# Aérodromes pour lesquels on publie les NOTAM en vigueur
-NOTAM_STATIONS = ["FMEE", "FMEP", "FMCZ"]
 
 # Observations Météo-France 6 min (API DPObs). La clé est lue dans le secret GitHub MF_APIKEY.
 MF_BASE = "https://public-api.meteofrance.fr/public/DPObs/"
@@ -84,10 +82,6 @@ def metar_time(raw):
     return int(d.timestamp())
 
 
-FAA_NOTAM = "https://notams.aim.faa.gov/notamSearch/search"
-AUTOROUTER = "https://api.autorouter.aero/v1.0/"
-
-
 def _ts(v):
     """epoch (s ou ms), ISO 8601 ou 'YYMMDDHHMM' -> epoch en secondes ; None si absent / PERM."""
     if v in (None, "", "PERM"):
@@ -108,76 +102,6 @@ def _ts(v):
         return None
 
 
-def parse_autorouter(rows, now=None):
-    """Lignes JSON autorouter -> liste de NOTAM en vigueur. Parseur tolérant : le schéma exact n'est pas documenté."""
-    now = now or time.time()
-    out, seen = [], set()
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        text = next((str(r[k]).strip() for k in ("message", "text", "notam", "raw", "icaoMessage", "iteme", "e", "body")
-                     if r.get(k)), "")
-        if not text:                       # rien d'exploitable : on garde la ligne brute plutôt que de la perdre
-            text = json.dumps(r, ensure_ascii=False)[:600]
-        mid = re.search(r"\(?([A-Z]\d{4}/\d{2})", text)
-        if mid:
-            nid = mid.group(1)
-        elif r.get("number") is not None:
-            nid = f"{r.get('series', '')}{r.get('number')}/{r.get('year', '')}"
-        else:
-            nid = str(r.get("id") or "?")
-        if nid in seen:
-            continue
-        seen.add(nid)
-        start = next((t for t in (_ts(r.get(k)) for k in ("startvalidity", "startValidity", "start", "from", "validfrom", "itemb")) if t), None)
-        end = next((t for t in (_ts(r.get(k)) for k in ("endvalidity", "endValidity", "end", "to", "validto", "itemc")) if t), None)
-        mb = re.search(r"\bB\)\s*(\d{10})", text)
-        mc = re.search(r"\bC\)\s*(\d{10}|PERM)", text)
-        start = start or (_notam_epoch(mb.group(1)) if mb else None)
-        perm = bool(mc and mc.group(1) == "PERM")
-        end = end or (_notam_epoch(mc.group(1)) if mc and not perm else None)
-        if start and start > now:
-            continue
-        if end and end < now:
-            continue
-        out.append({"id": nid, "from": start, "to": end, "perm": perm, "text": text})
-    out.sort(key=lambda x: x["from"] or 0, reverse=True)
-    return out[:40]
-
-
-def autorouter_token(email, password):
-    body = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": email,
-                                   "client_secret": password}).encode()
-    req = urllib.request.Request(AUTOROUTER + "oauth2/token", data=body, headers={
-        **UA, "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))["access_token"]
-    except urllib.error.HTTPError as e:      # remonte le message renvoyé par autorouter (compte non activé, identifiants refusés…)
-        try:
-            body = e.read().decode("utf-8", "replace")[:300].replace("\n", " ")
-        except Exception:
-            body = ""
-        raise RuntimeError(f"HTTP {e.code} {body}")
-
-
-def autorouter_notams(token, icao):
-    """GET /notam?itemas=["ICAO"]&offset=..&limit=.. (paginé), puis filtrage des NOTAM en vigueur."""
-    rows, offset, limit = [], 0, 100
-    for _ in range(5):
-        url = f"{AUTOROUTER}notam?itemas={urllib.parse.quote(json.dumps([icao]))}&offset={offset}&limit={limit}"
-        req = urllib.request.Request(url, headers={**UA, "Authorization": "Bearer " + token, "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            j = json.loads(r.read().decode("utf-8", "replace"))
-        page = j if isinstance(j, list) else (j.get("rows") or j.get("notams") or j.get("items") or j.get("data") or [])
-        rows += page
-        total = j.get("total") if isinstance(j, dict) else None
-        offset += limit
-        if len(page) < limit or (isinstance(total, int) and offset >= total):
-            break
-    return parse_autorouter(rows)
-
-
 def _notam_epoch(g):
     """'YYMMDDHHMM' (UTC) -> epoch ; None si absent."""
     try:
@@ -185,50 +109,6 @@ def _notam_epoch(g):
                             tzinfo=timezone.utc).timestamp())
     except (ValueError, TypeError):
         return None
-
-
-def parse_faa(j, now=None):
-    """Transforme la réponse FAA en liste de NOTAM actuellement en vigueur."""
-    now = now or time.time()
-    out, seen = [], set()
-    for n in (j.get("notamList") or []):
-        text = (n.get("icaoMessage") or n.get("traditionalMessage") or "").strip()
-        if not text:
-            continue
-        mid = re.search(r"\(?([A-Z]\d{4}/\d{2})", text)
-        nid = mid.group(1) if mid else str(n.get("notamNumber") or "?")
-        if nid in seen:
-            continue
-        seen.add(nid)
-        mb = re.search(r"\bB\)\s*(\d{10})", text)
-        mc = re.search(r"\bC\)\s*(\d{10}|PERM)", text)
-        start = _notam_epoch(mb.group(1)) if mb else None
-        perm = bool(mc and mc.group(1) == "PERM")
-        end = _notam_epoch(mc.group(1)) if mc and not perm else None
-        if start and start > now:      # pas encore en vigueur
-            continue
-        if end and end < now:          # expiré
-            continue
-        out.append({"id": nid, "from": start, "to": end, "perm": perm, "text": text})
-    out.sort(key=lambda x: x["from"] or 0, reverse=True)
-    return out[:40]
-
-
-def faa_notams(icao):
-    body = urllib.parse.urlencode({
-        "searchType": "0", "designatorsForLocation": icao, "designatorForAccountable": "",
-        "latDegrees": "", "latMinutes": "0", "latSeconds": "0", "longDegrees": "", "longMinutes": "0",
-        "longSeconds": "0", "radius": "10", "sortColumns": "5 false", "sortDirection": "true",
-        "designatorForNotamNumberSearch": "", "notamNumber": "", "radiusSearchOnDesignator": "false",
-        "radiusSearchDegrees": "", "flightPathText": "", "flightPathDivisor": "", "flightPathBuffer": "4",
-        "flightPathIncludeNavaids": "true", "flightPathIncludeArtcc": "false", "flightPathIncludeTfr": "true",
-        "flightPathIncludeRegulatory": "false", "flightPathResultsType": "All NOTAMs", "archiveDate": "",
-        "archiveDesignator": "", "offset": "0", "notamsOnly": "false", "filters": "", "formatType": "ICAO",
-    }).encode()
-    req = urllib.request.Request(FAA_NOTAM, data=body, headers={
-        **UA, "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return parse_faa(json.loads(r.read().decode("utf-8", "replace")))
 
 
 def _num(v):
@@ -449,40 +329,6 @@ def main():
     for st in STATIONS:
         out["stations"][st] = {"metar": metars.get(st), "taf": tafs.get(st),
                                "history": sorted(hist.get(st, []), key=lambda x: x["obsTime"])}
-
-    # NOTAM : rafraîchis toutes les 25 min seulement (ils changent peu) ; en cas d'échec on garde les précédents
-    prev_n, prev_ns = prev.get("notams") or {}, prev.get("notamSrc") or {}
-    fresh = _age_min(prev.get("notamUpdated")) < 25 and all(prev_n.get(s) is not None for s in NOTAM_STATIONS)
-    if fresh:
-        out["notamUpdated"], out["notams"], out["notamSrc"] = prev["notamUpdated"], prev_n, prev_ns
-    else:
-        out["notamUpdated"] = out["updated"]
-        out["notams"], out["notamSrc"] = {}, {}
-        token = None
-        em, pw = os.environ.get("AUTOROUTER_EMAIL"), os.environ.get("AUTOROUTER_PASSWORD")
-        if em and pw:
-            try:
-                token = autorouter_token(em, pw)
-            except Exception as e:
-                warn(f"autorouter jeton: {e}")
-        for st in NOTAM_STATIONS:
-            res, src = None, None
-            if token:
-                try:
-                    res, src = autorouter_notams(token, st), "autorouter"
-                except Exception as e:
-                    warn(f"autorouter {st}: {e}")
-            if res is None:
-                try:
-                    res, src = faa_notams(st), "FAA"
-                except Exception as e:
-                    if prev_n.get(st) is None:
-                        warn(f"faa {st}: {e}")
-            if res is None and prev_n.get(st) is not None:      # source en échec : on garde les NOTAM précédents
-                res, src = prev_n[st], prev_ns.get(st)
-                out["notamUpdated"] = prev.get("notamUpdated") or out["updated"]
-            out["notams"][st] = res            # None = source indisponible (différent de « aucun NOTAM »)
-            out["notamSrc"][st] = src
 
     # Observations Météo-France 6 min : température, humidité, pression, pluie (24 h glissantes)
     out["obsUpdated"] = out["updated"]
