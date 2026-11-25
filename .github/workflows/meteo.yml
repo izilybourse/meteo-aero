@@ -55,6 +55,8 @@ jobs:
                 done
                 exit 1
               ) || echo "publication échouée"
+              # rafraîchit la copie du CDN jsDelivr (second chemin de lecture de la page) ; sans importance si ça échoue
+              curl -s -m 10 -o /dev/null "https://purge.jsdelivr.net/gh/${{ github.repository }}@data/meteo.json" || true
             else
               echo "relevé ignoré (échec ou aucun METAR)"
             fi
