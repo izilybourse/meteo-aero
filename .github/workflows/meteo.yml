@@ -40,7 +40,7 @@ jobs:
             if git fetch --depth=1 origin data 2>/dev/null; then
               git show FETCH_HEAD:meteo.json > data/meteo.json 2>/dev/null || rm -f data/meteo.json
             fi
-            if timeout 120 python3 fetch_meteo.py; then
+            if timeout 200 python3 fetch_meteo.py && python3 -c "import json;json.load(open('data/meteo.json'))"; then
               # publie sur la branche « data » réécrite à chaque fois (pas d'historique qui grossit)
               rm -rf /tmp/pub && mkdir /tmp/pub && cp data/meteo.json /tmp/pub/
               (
@@ -50,7 +50,12 @@ jobs:
                 git config user.email "meteo-bot@users.noreply.github.com"
                 git add meteo.json
                 git commit -qm "maj $(date -u +%FT%TZ)"
-                git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+                # 3 tentatives : un échec réseau ponctuel ne doit pas laisser la page sur un fichier ancien
+                for t in 1 2 3; do
+                  git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data && exit 0
+                  echo "push échoué (essai $t)"; sleep $((t * 5))
+                done
+                exit 1
               ) || echo "publication échouée"
             else
               echo "relevé ignoré (échec ou aucun METAR)"

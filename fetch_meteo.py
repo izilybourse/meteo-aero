@@ -32,16 +32,37 @@ TGFTP = "https://tgftp.nws.noaa.gov/data/"
 UA = {"User-Agent": "izilyfire-meteo/1.0 (+github actions)"}
 
 
-def get(url, timeout=25):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+def get(url, timeout=20, tries=3):
+    """GET avec nouveaux essais (429, 5xx, délai dépassé, coupure réseau) et pauses croissantes."""
+    last = None
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (429, 500, 502, 503, 504):
+                raise
+        except (urllib.error.URLError, OSError) as e:      # inclut TimeoutError / ConnectionError
+            last = e
+        if k < tries - 1:
+            time.sleep(2 * (k + 1))
+    raise last
 
 
 def awc_json(kind, ids, hours=3):
     url = f"{AWC}{kind}?ids={','.join(ids)}&format=json" + (f"&hours={hours}" if kind == "metar" else "")
-    txt = get(url).strip()
-    return json.loads(txt) if txt else []
+    for k in range(2):
+        txt = get(url).strip()
+        if not txt:
+            return []
+        try:
+            return json.loads(txt)
+        except ValueError:                 # page d'erreur HTML renvoyée avec un code 200
+            if k == 1:
+                raise
+            time.sleep(3)
 
 
 def metar_time(raw):
@@ -301,12 +322,12 @@ def mf_obs(key, icao, sid):
     raise ValueError(" | ".join(notes)[:900])
 
 
-def load_prev_obs():
-    """Historique des observations déjà publié (l'API ne renvoie que la dernière observation de 6 min) :
-    fichier data/meteo.json récupéré par le workflow, sinon lecture publique de la branche data."""
+def load_prev():
+    """Dernier meteo.json publié : fichier récupéré par le workflow, sinon lecture publique de la branche data.
+    Sert à conserver l'historique des observations et à reprendre les dernières données valides si une source échoue."""
     try:
         with open("data/meteo.json", encoding="utf-8") as f:
-            return json.load(f).get("obs") or {}
+            return json.load(f) or {}
     except Exception:
         pass
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -314,10 +335,14 @@ def load_prev_obs():
         try:
             req = urllib.request.Request(f"https://raw.githubusercontent.com/{repo}/data/meteo.json?t={int(time.time())}", headers=UA)
             with urllib.request.urlopen(req, timeout=20) as r:
-                return json.loads(r.read().decode("utf-8")).get("obs") or {}
+                return json.loads(r.read().decode("utf-8")) or {}
         except Exception:
             pass
     return {}
+
+
+def load_prev_obs():
+    return load_prev().get("obs") or {}
 
 
 def merge_series(prev, new, now=None):
@@ -328,9 +353,43 @@ def merge_series(prev, new, now=None):
     return [rows[k] for k in sorted(rows)]
 
 
+OM_VARS = ("current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl"
+           "&hourly=pressure_msl,temperature_2m,relative_humidity_2m,dew_point_2m,wind_speed_10m,wind_gusts_10m,visibility,precipitation"
+           "&minutely_15=precipitation&past_hours=24&forecast_hours=1&past_minutely_15=8&forecast_minutely_15=4"
+           "&wind_speed_unit=kn&timezone=UTC")
+
+
+def fetch_model():
+    """Modèle Open-Meteo pour les 3 aérodromes en UNE requête (évite les limites côté visiteurs). {icao: réponse}."""
+    ids = list(AIRFIELDS)
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=" + ",".join(str(AIRFIELDS[i][0]) for i in ids)
+           + "&longitude=" + ",".join(str(AIRFIELDS[i][1]) for i in ids) + "&" + OM_VARS)
+    j = json.loads(get(url, timeout=25, tries=3))
+    arr = j if isinstance(j, list) else [j]
+    if len(arr) != len(ids) or not all(isinstance(x, dict) and not x.get("error") and x.get("current")
+                                        and (x.get("hourly") or {}).get("pressure_msl") for x in arr):
+        raise ValueError("réponse incomplète : " + (str(j.get("reason")) if isinstance(j, dict) else "format inattendu"))
+    return dict(zip(ids, arr))
+
+
+def _age_min(iso_or_none, now=None):
+    try:
+        t = datetime.strptime(iso_or_none, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        return ((now or time.time()) - t) / 60
+    except Exception:
+        return 1e9
+
+
 def main():
+    now = time.time()
     out = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "stations": {}, "errors": []}
+    prev = load_prev()
+    prev_st = prev.get("stations") or {}
     metars, tafs = {}, {}
+
+    def warn(msg):
+        if msg not in out["errors"]:
+            out["errors"].append(msg)
 
     # 1) API JSON NOAA (toutes les stations en une requête)
     try:
@@ -339,76 +398,96 @@ def main():
             if not cur or m.get("obsTime", 0) > cur.get("obsTime", 0):
                 metars[m["icaoId"]] = m
     except Exception as e:
-        out["errors"].append(f"awc metar: {e}")
+        warn(f"awc metar: {e}")
     try:
         for t in awc_json("taf", STATIONS):
             tafs.setdefault(t["icaoId"], t)
     except Exception as e:
-        out["errors"].append(f"awc taf: {e}")
+        warn(f"awc taf: {e}")
 
     # 2) Repli : fichiers texte NOAA, station par station
     for st in STATIONS:
         if st not in metars:
             try:
-                lines = [l.strip() for l in get(f"{TGFTP}observations/metar/stations/{st}.TXT").splitlines() if l.strip()]
+                lines = [l.strip() for l in get(f"{TGFTP}observations/metar/stations/{st}.TXT", tries=2).splitlines() if l.strip()]
                 raw = re.sub(r"^(METAR|SPECI)\s+", "", lines[-1])
                 if raw.startswith(st):
                     metars[st] = {"icaoId": st, "rawOb": raw, "obsTime": metar_time(raw), "raw_only": True}
             except Exception as e:
-                out["errors"].append(f"tgftp metar {st}: {e}")
+                warn(f"tgftp metar {st}: {e}")
         if st not in tafs:
             try:
-                lines = [l.strip() for l in get(f"{TGFTP}forecasts/taf/stations/{st}.TXT").splitlines() if l.strip()]
+                lines = [l.strip() for l in get(f"{TGFTP}forecasts/taf/stations/{st}.TXT", tries=2).splitlines() if l.strip()]
                 raw = " ".join(lines[1:])
                 if st in raw:
                     tafs[st] = {"icaoId": st, "rawTAF": raw}
             except Exception as e:
-                out["errors"].append(f"tgftp taf {st}: {e}")
+                warn(f"tgftp taf {st}: {e}")
 
-    # Historique METAR 6 h (affiché en popup par la page)
+    # 3) Reprise de la dernière donnée valide si NOAA n'a rien donné (METAR ≤ 6 h, TAF ≤ 12 h) : la page affiche son âge réel
+    for st in STATIONS:
+        p = prev_st.get(st) or {}
+        pm, pt = p.get("metar"), p.get("taf")
+        if st not in metars and pm and pm.get("obsTime") and now - pm["obsTime"] < 6 * 3600:
+            metars[st] = {**pm, "carried": True}
+        if st not in tafs and pt and now - (_ts(pt.get("issueTime")) or _ts(pt.get("bulletinTime")) or now) < 12 * 3600:
+            tafs[st] = {**pt, "carried": True}
+
+    # Historique METAR 6 h (affiché en popup par la page) ; repris tel quel si la requête échoue
     hist = {}
     try:
         for m in awc_json("metar", STATIONS, 6):
             if m.get("rawOb") and m.get("obsTime"):
                 hist.setdefault(m["icaoId"], []).append({"icaoId": m["icaoId"], "obsTime": m["obsTime"], "rawOb": m["rawOb"]})
     except Exception as e:
-        out["errors"].append(f"awc metar 6h: {e}")
+        warn(f"awc metar 6h: {e}")
+        for st in STATIONS:
+            h = [x for x in ((prev_st.get(st) or {}).get("history") or []) if x.get("obsTime", 0) > now - 6 * 3600]
+            if h:
+                hist[st] = h
 
     for st in STATIONS:
         out["stations"][st] = {"metar": metars.get(st), "taf": tafs.get(st),
                                "history": sorted(hist.get(st, []), key=lambda x: x["obsTime"])}
 
-    # NOTAM en vigueur : autorouter en priorité (identifiants dans les secrets GitHub), repli FAA
-    out["notamUpdated"] = out["updated"]
-    out["notams"], out["notamSrc"] = {}, {}
-    token = None
-    em, pw = os.environ.get("AUTOROUTER_EMAIL"), os.environ.get("AUTOROUTER_PASSWORD")
-    if em and pw:
-        try:
-            token = autorouter_token(em, pw)
-        except Exception as e:
-            out["errors"].append(f"autorouter jeton: {e}")
+    # NOTAM : rafraîchis toutes les 25 min seulement (ils changent peu) ; en cas d'échec on garde les précédents
+    prev_n, prev_ns = prev.get("notams") or {}, prev.get("notamSrc") or {}
+    fresh = _age_min(prev.get("notamUpdated")) < 25 and all(prev_n.get(s) is not None for s in NOTAM_STATIONS)
+    if fresh:
+        out["notamUpdated"], out["notams"], out["notamSrc"] = prev["notamUpdated"], prev_n, prev_ns
     else:
-        out["errors"].append("autorouter: secrets AUTOROUTER_EMAIL / AUTOROUTER_PASSWORD absents")
-    for st in NOTAM_STATIONS:
-        res, src = None, None
-        if token:
+        out["notamUpdated"] = out["updated"]
+        out["notams"], out["notamSrc"] = {}, {}
+        token = None
+        em, pw = os.environ.get("AUTOROUTER_EMAIL"), os.environ.get("AUTOROUTER_PASSWORD")
+        if em and pw:
             try:
-                res, src = autorouter_notams(token, st), "autorouter"
+                token = autorouter_token(em, pw)
             except Exception as e:
-                out["errors"].append(f"autorouter {st}: {e}")
-        if res is None:
-            try:
-                res, src = faa_notams(st), "FAA"
-            except Exception as e:
-                out["errors"].append(f"faa {st}: {e}")
-        out["notams"][st] = res            # None = source indisponible (différent de « aucun NOTAM »)
-        out["notamSrc"][st] = src
+                warn(f"autorouter jeton: {e}")
+        for st in NOTAM_STATIONS:
+            res, src = None, None
+            if token:
+                try:
+                    res, src = autorouter_notams(token, st), "autorouter"
+                except Exception as e:
+                    warn(f"autorouter {st}: {e}")
+            if res is None:
+                try:
+                    res, src = faa_notams(st), "FAA"
+                except Exception as e:
+                    if prev_n.get(st) is None:
+                        warn(f"faa {st}: {e}")
+            if res is None and prev_n.get(st) is not None:      # source en échec : on garde les NOTAM précédents
+                res, src = prev_n[st], prev_ns.get(st)
+                out["notamUpdated"] = prev.get("notamUpdated") or out["updated"]
+            out["notams"][st] = res            # None = source indisponible (différent de « aucun NOTAM »)
+            out["notamSrc"][st] = src
 
     # Observations Météo-France 6 min : température, humidité, pression, pluie (24 h glissantes)
     out["obsUpdated"] = out["updated"]
     out["obs"], out["obsErr"] = {}, {}
-    prev_obs = load_prev_obs()
+    prev_obs = prev.get("obs") or {}
     mf_key = os.environ.get("MF_APIKEY")
     for icao, sid in MF_STATIONS.items():
         if not mf_key:
@@ -419,18 +498,46 @@ def main():
             res["series"] = merge_series((prev_obs.get(icao) or {}).get("series"), res["series"])
             out["obs"][icao] = res
             if res["dist"] is not None and res["dist"] > 20:
-                out["errors"].append(f"mf {icao}: station {sid} à {res['dist']} km de l'aérodrome, vérifier l'identifiant")
+                warn(f"mf {icao}: station {sid} à {res['dist']} km de l'aérodrome, vérifier l'identifiant")
         except Exception as e:
-            out["obsErr"][icao] = str(e)[:900]
-            out["errors"].append(f"mf {icao}: {str(e)[:900]}")
+            old = prev_obs.get(icao)
+            if old and old.get("series"):                 # on garde l'historique ; avertissement seulement si la dernière mesure est ancienne
+                old["series"] = merge_series(old["series"], [])
+                out["obs"][icao] = old
+                last = old["series"][-1][0] if old["series"] else 0
+                if now - last > 30 * 60:
+                    warn(f"mf {icao}: dernière mesure il y a {int((now - last) / 60)} min ({str(e)[:200]})")
+            else:
+                out["obsErr"][icao] = str(e)[:900]
+                warn(f"mf {icao}: {str(e)[:900]}")
+
+    # Modèle Open-Meteo relayé (toutes les ~10 min, une requête groupée) ; la page n'appelle plus Open-Meteo directement
+    pm_ = prev.get("model") or {}
+    if pm_ and _age_min(prev.get("modelUpdated")) < 10 and all(i in pm_ for i in AIRFIELDS):
+        out["model"], out["modelUpdated"] = pm_, prev["modelUpdated"]
+    else:
+        try:
+            out["model"], out["modelUpdated"] = fetch_model(), out["updated"]
+        except Exception as e:
+            if pm_ and _age_min(prev.get("modelUpdated")) < 120:
+                out["model"], out["modelUpdated"] = pm_, prev.get("modelUpdated")
+                if _age_min(prev.get("modelUpdated")) > 40:
+                    warn(f"open-meteo: {str(e)[:200]} (données de il y a {int(_age_min(prev.get('modelUpdated')))} min)")
+            else:
+                warn(f"open-meteo: {str(e)[:200]}")
 
     if not metars:
         print("Aucun METAR récupéré — fichier non publié.", out["errors"], file=sys.stderr)
         sys.exit(1)
 
+    # écriture atomique + relecture de contrôle : le fichier publié est toujours un JSON complet
     os.makedirs("data", exist_ok=True)
-    with open("data/meteo.json", "w", encoding="utf-8") as f:
+    tmp = "data/meteo.json.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+    with open(tmp, encoding="utf-8") as f:
+        json.load(f)
+    os.replace(tmp, "data/meteo.json")
     print(f"OK : {len(metars)} METAR, {len(tafs)} TAF, {len(out['errors'])} avertissement(s)")
 
 
